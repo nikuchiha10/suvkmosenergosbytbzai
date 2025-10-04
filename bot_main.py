@@ -3,40 +3,38 @@ import logging
 import sqlite3
 import aiohttp
 import json
+import os
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-import time
-import os
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
 from config import *
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/bot.log'),
+        logging.FileHandler('logs/bot.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация бота
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+# Инициализация бота с правильными настройками
+bot = Bot(
+    token=TELEGRAM_BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
 
 # Статистика точности
 accuracy_stats = {"total": 0, "correct": 0}
 
 class KnowledgeBase:
-    """Класс для работы с базой знаний"""
-    
     @staticmethod
     def load_articles():
         """Загружает статьи из базы знаний"""
@@ -60,7 +58,6 @@ class KnowledgeBase:
             if score > 0:
                 relevant_articles.append((article, score))
         
-        # Сортируем по релевантности
         relevant_articles.sort(key=lambda x: x[1], reverse=True)
         return [article[0] for article in relevant_articles]
     
@@ -72,10 +69,9 @@ class KnowledgeBase:
         
         score = 0
         for word in query_words:
-            if len(word) > 3:  # Игнорируем короткие слова
+            if len(word) > 3:
                 score += article_lower.count(word) * len(word)
         
-        # Бонус за точное совпадение фраз
         if query.lower() in article_lower:
             score += 100
         
@@ -86,36 +82,20 @@ class KnowledgeBase:
         """Извлекает скрипт для оператора из статьи"""
         lines = article.split('\n')
         script_lines = []
-        in_script_section = False
         
-        for line in lines:
-            if any(keyword in line for keyword in ['💬', 'Что сказать', 'скрипт', 'речь оператора']):
-                in_script_section = True
-                continue
-            if in_script_section and line.strip():
-                if line.startswith('---') or '========' in line:
-                    break
-                script_lines.append(line.strip())
-        
-        if script_lines:
-            return '\n'.join(script_lines[:10])  # Ограничиваем длину
-        
-        # Если нет специального скрипта, пытаемся найти основные рекомендации
+        # Ищем блоки с инструкциями для оператора
         for i, line in enumerate(lines):
-            if 'Действия оператора' in line or 'Консультация' in line:
+            line_lower = line.lower()
+            if any(keyword in line_lower for keyword in ['💬', 'что сказать', 'скрипт', 'речь оператора', 'действия оператора']):
                 # Берем следующие 3-5 строк как скрипт
-                script_content = []
                 for j in range(i+1, min(i+6, len(lines))):
-                    if lines[j].strip() and not lines[j].startswith('---'):
-                        script_content.append(lines[j].strip())
-                if script_content:
-                    return '\n'.join(script_content)
+                    if lines[j].strip() and not lines[j].startswith('---') and '===' not in lines[j]:
+                        script_lines.append(lines[j].strip())
+                break
         
-        return None
+        return '\n'.join(script_lines) if script_lines else None
 
 class ResponseGenerator:
-    """Класс для генерации ответов"""
-    
     @staticmethod
     async def generate_response(question):
         """Генерирует ответ на вопрос"""
@@ -128,20 +108,14 @@ class ResponseGenerator:
             script = KnowledgeBase.extract_script(best_article)
             title = ResponseGenerator.get_article_title(best_article)
             
-            # Если вопрос очень конкретный и есть точный ответ
-            if ResponseGenerator.is_direct_answer(question, content):
-                return content, script, title
-            
-            # Используем нейросеть для улучшения ответа
-            enhanced_response = await ResponseGenerator.enhance_with_ai(question, content)
-            if enhanced_response:
-                return enhanced_response, script, title
-            else:
-                return content, script, title
+            return content, script, title
         
-        # Если в базе нет ответа, используем только нейросеть
+        # Если в базе нет ответа, используем нейросеть
         ai_response = await ResponseGenerator.ask_huggingface(question)
-        return ai_response, None, "Нейросеть"
+        if ai_response:
+            return ai_response, None, "Нейросеть"
+        else:
+            return "К сожалению, я не нашел информации по вашему вопросу в базе знаний. Пожалуйста, обратитесь к старшему оператору.", None, "Не найдено"
     
     @staticmethod
     def extract_main_content(article):
@@ -157,21 +131,21 @@ class ResponseGenerator:
             if in_content and line.strip():
                 if line.startswith('---') or '========' in line:
                     break
-                if not line.startswith('МО') and not line.startswith('Поиск'):
+                if len(line.strip()) > 10:  # Только значимые строки
                     content_lines.append(line.strip())
         
         if content_lines:
-            return '\n'.join(content_lines[:15])  # Ограничиваем длину
+            return '\n'.join(content_lines[:10])  # Ограничиваем длину
         
         # Если не нашли структурированного содержания, возвращаем первые значимые строки
         meaningful_lines = []
         for line in lines:
-            if line.strip() and len(line.strip()) > 10 and not line.startswith('==='):
+            if line.strip() and len(line.strip()) > 20 and not line.startswith(('===', '---', 'МО', 'Поиск')):
                 meaningful_lines.append(line.strip())
-            if len(meaningful_lines) >= 10:
+            if len(meaningful_lines) >= 5:
                 break
         
-        return '\n'.join(meaningful_lines) if meaningful_lines else article[:500] + "..."
+        return '\n'.join(meaningful_lines) if meaningful_lines else article[:300] + "..."
     
     @staticmethod
     def get_article_title(article):
@@ -185,38 +159,6 @@ class ResponseGenerator:
         return "Статья из базы знаний"
     
     @staticmethod
-    def is_direct_answer(question, content):
-        """Проверяет, есть ли прямой ответ на вопрос в содержании"""
-        question_lower = question.lower()
-        content_lower = content.lower()
-        
-        # Ключевые слова, указывающие на прямой ответ
-        direct_keywords = ['да', 'нет', 'можно', 'нельзя', 'нужно', 'не нужно']
-        
-        if any(keyword in question_lower for keyword in ['можно ли', 'возможно ли', 'есть ли']):
-            return any(keyword in content_lower for keyword in direct_keywords)
-        
-        return False
-    
-    @staticmethod
-    async def enhance_with_ai(question, context):
-        """Улучшает ответ с помощью нейросети"""
-        try:
-            prompt = f"""
-            Вопрос: {question}
-            Контекст: {context[:800]}
-            
-            Дай точный и краткий ответ на вопрос на основе контекста. 
-            Если в контексте нет информации - верни None.
-            Ответ:
-            """
-            
-            return await ResponseGenerator.ask_huggingface(prompt)
-        except Exception as e:
-            logger.error(f"Ошибка улучшения ответа: {e}")
-            return None
-    
-    @staticmethod
     async def ask_huggingface(prompt):
         """Запрос к HuggingFace API"""
         try:
@@ -225,8 +167,9 @@ class ResponseGenerator:
                 "inputs": prompt,
                 "parameters": {
                     "max_length": MAX_RESPONSE_LENGTH,
-                    "temperature": 0.3,
-                    "do_sample": False
+                    "min_length": 50,
+                    "do_sample": False,
+                    "temperature": 0.7
                 }
             }
             
@@ -235,109 +178,65 @@ class ResponseGenerator:
                     HUGGINGFACE_API_URL, 
                     headers=headers, 
                     json=payload,
-                    timeout=30
+                    timeout=REQUEST_TIMEOUT
                 ) as response:
                     
                     if response.status == 200:
                         result = await response.json()
+                        logger.info(f"HuggingFace response: {result}")
+                        
                         if isinstance(result, list) and len(result) > 0:
-                            return result[0].get('generated_text', 'Не удалось сгенерировать ответ')
+                            if 'generated_text' in result[0]:
+                                return result[0]['generated_text']
+                            else:
+                                return str(result[0])
                         else:
                             return str(result)
                     else:
-                        logger.error(f"Ошибка API: {response.status}")
+                        error_text = await response.text()
+                        logger.error(f"HuggingFace API error {response.status}: {error_text}")
                         return None
                         
+        except asyncio.TimeoutError:
+            logger.error("Timeout from HuggingFace API")
+            return None
         except Exception as e:
-            logger.error(f"Ошибка запроса к нейросети: {e}")
+            logger.error(f"HuggingFace request error: {e}")
             return None
 
-class Parser:
-    """Класс для парсинга базы знаний"""
-    
+class DatabaseManager:
     @staticmethod
-    async def update_knowledge_base():
-        """Обновляет базу знаний"""
-        try:
-            logger.info("Запуск парсера для обновления базы знаний")
-            
-            # Создаем резервную копию
-            Parser.create_backup()
-            
-            # Запускаем парсинг
-            success = Parser.run_parsing()
-            
-            if success:
-                logger.info("База знаний успешно обновлена")
-                return True
-            else:
-                logger.error("Ошибка при парсинге")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Критическая ошибка при обновлении базы: {e}")
-            return False
-    
-    @staticmethod
-    def create_backup():
-        """Создает резервную копию базы знаний"""
-        try:
-            if os.path.exists(KNOWLEDGE_FILE):
-                import shutil
-                shutil.copy2(KNOWLEDGE_FILE, BACKUP_KNOWLEDGE_FILE)
-                logger.info("Резервная копия создана")
-        except Exception as e:
-            logger.error(f"Ошибка создания резервной копии: {e}")
-    
-    @staticmethod
-    def run_parsing():
-        """Запускает процесс парсинга"""
-        driver = None
-        try:
-            # Настройка браузера
-            options = webdriver.ChromeOptions()
-            options.add_argument('--headless')  # Режим без графического интерфейса
-            options.add_argument('--no-sandbox')
-            options.add_argument('--disable-dev-shm-usage')
-            
-            driver = webdriver.Chrome(options=options)
-            driver.get(LOGIN_URL)
-            
-            logger.info("Браузер открыт. Ожидание ручного входа...")
-            
-            # Ждем, пока пользователь вручную войдет в систему
-            WebDriverWait(driver, 300).until(  # 5 минут timeout
-                EC.presence_of_element_located((By.CLASS_NAME, "content-space"))
+    def init_db():
+        """Инициализация базы данных"""
+        conn = sqlite3.connect(USER_DB_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                is_admin BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-            
-            logger.info("Успешный вход detected. Начинаем сбор статей...")
-            
-            # Здесь должна быть логика сбора статей
-            # Для демонстрации просто копируем существующий файл
-            if os.path.exists(KNOWLEDGE_FILE):
-                with open(KNOWLEDGE_FILE, 'r', encoding='utf-8') as source:
-                    content = source.read()
-                
-                # Добавляем метку времени
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                updated_content = f"=== БАЗА ЗНАНИЙ - ОБНОВЛЕНО {timestamp} ===\n{content}"
-                
-                with open(TEMP_KNOWLEDGE_FILE, 'w', encoding='utf-8') as target:
-                    target.write(updated_content)
-                
-                # Заменяем основную базу
-                os.replace(TEMP_KNOWLEDGE_FILE, KNOWLEDGE_FILE)
-                
-                return True
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Ошибка парсинга: {e}")
-            return False
-        finally:
-            if driver:
-                driver.quit()
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    @staticmethod
+    def save_user(user_id, username, first_name):
+        """Сохраняет пользователя в БД"""
+        conn = sqlite3.connect(USER_DB_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO users (user_id, username, first_name, is_admin)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, username, first_name, user_id in ADMIN_IDS))
+        
+        conn.commit()
+        conn.close()
 
 # Клавиатуры
 def main_menu_keyboard():
@@ -353,7 +252,6 @@ def admin_keyboard():
         [InlineKeyboardButton(text="🔄 Обновить базу", callback_data="update_base")],
         [InlineKeyboardButton(text="🗑️ Очистить базу", callback_data="clear_base")],
         [InlineKeyboardButton(text="📤 Экспорт базы", callback_data="export_base")],
-        [InlineKeyboardButton(text="📥 Импорт базы", callback_data="import_base")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
     ])
 
@@ -371,37 +269,28 @@ async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     user_name = message.from_user.first_name
     
-    # Сохраняем пользователя в БД
-    conn = sqlite3.connect(USER_DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            is_admin BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    cursor.execute(
-        "INSERT OR IGNORE INTO users (user_id, username, first_name, is_admin) VALUES (?, ?, ?, ?)",
-        (user_id, message.from_user.username, user_name, user_id in ADMIN_IDS)
-    )
-    conn.commit()
-    conn.close()
+    # Сохраняем пользователя
+    DatabaseManager.save_user(user_id, message.from_user.username, user_name)
+    
+    # Создаем базу знаний если её нет
+    if not os.path.exists(KNOWLEDGE_FILE):
+        with open(KNOWLEDGE_FILE, 'w', encoding='utf-8') as f:
+            f.write("=== БАЗА ЗНАНИЙ ===\nВремя создания: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    
+    articles_count = len(KnowledgeBase.load_articles())
     
     await message.answer(
-        f"🤖 Добро пожаловать, {user_name}!\n"
+        f"🤖 <b>Добро пожаловать, {user_name}!</b>\n\n"
         f"Я - бот-помощник для операторов МосОблЕИРЦ\n\n"
-        f"📚 База знаний: {len(KnowledgeBase.load_articles())} статей\n"
-        f"🎯 Точность ответов: {get_accuracy()}",
+        f"📚 Статей в базе: <b>{articles_count}</b>\n"
+        f"🎯 Точность ответов: <b>{get_accuracy()}</b>",
         reply_markup=main_menu_keyboard()
     )
 
 @dp.callback_query(lambda c: c.data == "ask_question")
 async def ask_question(callback: types.CallbackQuery):
     await callback.message.answer(
-        "💬 Задайте ваш вопрос:\n\n"
+        "💬 <b>Задайте ваш вопрос:</b>\n\n"
         "Примеры вопросов:\n"
         "• «Какие сроки передачи показаний?»\n"
         "• «Как получить справку об отсутствии задолженности?»\n"
@@ -413,29 +302,29 @@ async def ask_question(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "conversation_tips")
 async def conversation_tips(callback: types.CallbackQuery):
     tips = """
-🎯 **Советы по разговору с клиентом:**
+🎯 <b>Советы по разговору с клиентом:</b>
 
-1. **Приветствие**: «Добрый день! Меня зовут [Имя], компания МосОблЕИРЦ. Чем могу помочь?»
+1. <b>Приветствие</b>: «Добрый день! Меня зовут [Имя], компания МосОблЕИРЦ. Чем могу помочь?»
 
-2. **Активное слушание**: 
-   - «Понял ваш вопрос...»
-   - «Уточните, пожалуйста...»
-   - «Правильно ли я понимаю, что...»
+2. <b>Активное слушание</b>:
+   • «Понял ваш вопрос...»
+   • «Уточните, пожалуйста...»
+   • «Правильно ли я понимаю, что...»
 
-3. **Четкие ответы**:
-   - «Да, это возможно...»
-   - «К сожалению, нет...»
-   - «Для этого вам нужно...»
+3. <b>Четкие ответы</b>:
+   • «Да, это возможно...»
+   • «К сожалению, нет...»
+   • «Для этого вам нужно...»
 
-4. **Решение проблем**:
-   - «Я понимаю вашу ситуацию...»
-   - «Предлагаю следующий вариант...»
-   - «Можем оформить заявку...»
+4. <b>Решение проблем</b>:
+   • «Я понимаю вашу ситуацию...»
+   • «Предлагаю следующий вариант...»
+   • «Можем оформить заявку...»
 
-5. **Завершение разговора**:
-   - «Все ли было понятно?»
-   - «Есть ли еще вопросы?»
-   - «Хорошего дня!»
+5. <b>Завершение разговора</b>:
+   • «Все ли было понятно?»
+   • «Есть ли еще вопросы?»
+   • «Хорошего дня!»
 """
     await callback.message.answer(tips)
     await callback.answer()
@@ -451,17 +340,17 @@ async def show_accuracy(callback: types.CallbackQuery):
     last_update = get_last_update_time()
     
     stats_text = f"""
-📊 **Статистика бота:**
+📊 <b>Статистика бота:</b>
 
-• Всего ответов: {accuracy_stats['total']}
-• Правильных ответов: {accuracy_stats['correct']}
-• Точность: {get_accuracy()}
-• Статей в базе: {articles_count}
-• Последнее обновление: {last_update}
+• Всего ответов: <b>{accuracy_stats['total']}</b>
+• Правильных ответов: <b>{accuracy_stats['correct']}</b>
+• Точность: <b>{get_accuracy()}</b>
+• Статей в базе: <b>{articles_count}</b>
+• Последнее обновление: <b>{last_update}</b>
 
-📈 **Эффективность:**
-- База знаний: {'✅ Актуальна' if articles_count > 0 else '❌ Требует обновления'}
-- Нейросеть: {'✅ Работает' if HUGGINGFACE_API_KEY else '❌ Отключена'}
+📈 <b>Эффективность:</b>
+• База знаний: {'✅ Актуальна' if articles_count > 0 else '❌ Требует обновления'}
+• Нейросеть: {'✅ Работает' if HUGGINGFACE_API_KEY else '❌ Отключена'}
 """
     await callback.message.answer(stats_text)
     await callback.answer()
@@ -474,7 +363,7 @@ async def admin_panel(callback: types.CallbackQuery):
         return
     
     await callback.message.answer(
-        "⚙️ **Панель администратора**\n\n"
+        "⚙️ <b>Панель администратора</b>\n\n"
         "Управление базой знаний и настройками бота",
         reply_markup=admin_keyboard()
     )
@@ -488,37 +377,79 @@ async def update_base(callback: types.CallbackQuery):
         return
     
     await callback.message.answer(
-        "🔄 **Запуск обновления базы знаний...**\n\n"
-        "Процесс займет несколько минут:\n"
-        "1. ✅ Создание резервной копии\n"
-        "2. 🔓 Открытие браузера для входа\n"
-        "3. 👤 Ожидание ручного входа\n"
-        "4. 📥 Сбор новых статей\n"
-        "5. 💾 Обновление базы данных\n\n"
-        "⏳ Начинаю процесс..."
+        "🔄 <b>Запуск обновления базы знаний...</b>\n\n"
+        "Для демонстрации создается тестовая база знаний.\n"
+        "В реальной версии здесь будет запущен парсер."
     )
     
-    # Запускаем обновление
-    success = await Parser.update_knowledge_base()
+    # Создаем тестовую базу знаний для демонстрации
+    test_knowledge = """=== БАЗА ЗНАНИЙ - ТЕСТОВАЯ ВЕРСИЯ ===
+Время сбора: 2024-01-01 12:00:00
+Обработано: 3 статей
+==================================================
+
+СТАТЬЯ 1: Передача показаний ПУ
+URL: https://mes1-kms.interrao.ru/content/space/7/article/8352
+Заголовок: Способы передачи показаний
+Время обработки: 12:00:00
+---
+СОДЕРЖАНИЕ:
+Передать показания ПУ коммунальных ресурсов можно одним из способов:
+• В ЛКК на сайте мособлеирц.рф
+• В мобильном приложении «МосОблЕИРЦ Онлайн»
+• По телефону КЦ 8(499)444-01-00 (голосовой помощник)
+• С помощью чат-бота на сайте
+• В клиентских офисах МосОблЕИРЦ
+
+💬 Что сказать клиенту:
+«Вы можете передать показания через личный кабинет, мобильное приложение или по телефону контактного центра.»
+
+---
+==================================================
+
+СТАТЬЯ 2: Оплата счетов
+URL: https://mes1-kms.interrao.ru/content/space/7/article/8185
+Заголовок: Способы оплаты
+Время обработки: 12:00:00
+---
+СОДЕРЖАНИЕ:
+Оплатить ЕПД можно любым удобным способом:
+Без комиссии:
+• В мобильном приложении «МосОблЕИРЦ Онлайн»
+• Через кнопку моментальной оплаты на сайте
+• В клиентских офисах через POS-терминалы
+• Через онлайн-сервисы банков
+
+💬 Что сказать клиенту:
+«Оплатить счет можно без комиссии через наше мобильное приложение или на сайте.»
+
+---
+==================================================
+
+СТАТЬЯ 3: Личный кабинет
+URL: https://mes1-kms.interrao.ru/content/space/7/article/8536
+Заголовок: Регистрация в ЛКК
+Время обработки: 12:00:00
+---
+СОДЕРЖАНИЕ:
+ЛКК – удобный сервис для решения вопросов ЖКХ в онлайн-режиме.
+Преимущества:
+• Оплата счетов
+• Передача показаний ПУ
+• Просмотр истории платежей
+• Получение справок и выписок
+
+💬 Что сказать клиенту:
+«Зарегистрируйтесь в личном кабинете для удобного управления вашими счетами онлайн.»
+
+---
+==================================================
+"""
     
-    if success:
-        articles_count = len(KnowledgeBase.load_articles())
-        await callback.message.answer(
-            f"✅ **База знаний успешно обновлена!**\n\n"
-            f"• Статей в базе: {articles_count}\n"
-            f"• Время обновления: {datetime.now().strftime('%H:%M:%S')}\n"
-            f"• Резервная копия: создана"
-        )
-    else:
-        await callback.message.answer(
-            "❌ **Ошибка при обновлении базы знаний**\n\n"
-            "Проверьте:\n"
-            "• Доступ к сайту МосОблЕИРЦ\n"
-            "• Логин и пароль администратора\n"
-            "• Интернет-соединение\n\n"
-            "Резервная копия восстановлена."
-        )
+    with open(KNOWLEDGE_FILE, 'w', encoding='utf-8') as f:
+        f.write(test_knowledge)
     
+    await callback.message.answer("✅ <b>Тестовая база знаний создана!</b>\n\nТеперь бот готов к работе с демонстрационными данными.")
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "clear_base")
@@ -536,7 +467,7 @@ async def clear_base(callback: types.CallbackQuery):
     ])
     
     await callback.message.answer(
-        "⚠️ **Очистка базы знаний**\n\n"
+        "⚠️ <b>Очистка базы знаний</b>\n\n"
         "Вы уверены, что хотите полностью очистить базу знаний?\n"
         "Это действие нельзя отменить!",
         reply_markup=confirm_keyboard
@@ -551,30 +482,32 @@ async def export_base(callback: types.CallbackQuery):
         return
     
     try:
-        with open(KNOWLEDGE_FILE, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        # Сохраняем во временный файл для отправки
-        export_filename = f"knowledge_export_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
-        with open(export_filename, 'w', encoding='utf-8') as f:
-            f.write(content)
-        
-        # Отправляем файл
-        with open(export_filename, 'rb') as file:
-            await callback.message.answer_document(
-                types.BufferedInputFile(
-                    file.read(),
-                    filename=export_filename
-                ),
-                caption="📤 Экспорт базы знаний"
-            )
-        
-        # Удаляем временный файл
-        os.remove(export_filename)
-        
+        if os.path.exists(KNOWLEDGE_FILE):
+            with open(KNOWLEDGE_FILE, 'rb') as file:
+                await callback.message.answer_document(
+                    types.BufferedInputFile(
+                        file.read(),
+                        filename=f"knowledge_export_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+                    ),
+                    caption="📤 <b>Экспорт базы знаний</b>"
+                )
+        else:
+            await callback.message.answer("❌ Файл базы знаний не найден")
     except Exception as e:
         await callback.message.answer(f"❌ Ошибка экспорта: {str(e)}")
     
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "back_to_main")
+async def back_to_main(callback: types.CallbackQuery):
+    articles_count = len(KnowledgeBase.load_articles())
+    
+    await callback.message.answer(
+        f"🤖 <b>Главное меню</b>\n\n"
+        f"📚 Статей в базе: <b>{articles_count}</b>\n"
+        f"🎯 Точность ответов: <b>{get_accuracy()}</b>",
+        reply_markup=main_menu_keyboard()
+    )
     await callback.answer()
 
 # Обработчик вопросов
@@ -591,7 +524,7 @@ async def handle_questions(message: types.Message):
         return
     
     # Показываем, что бот думает
-    thinking_msg = await message.answer("🔍 Ищу ответ в базе знаний...")
+    thinking_msg = await message.answer("🔍 <i>Ищу ответ в базе знаний...</i>")
     
     try:
         # Генерируем ответ
@@ -602,15 +535,15 @@ async def handle_questions(message: types.Message):
             return
         
         # Форматируем ответ
-        response_text = f"🤖 **Ответ:**\n{response}"
+        response_text = f"🤖 <b>Ответ:</b>\n{response}"
         if source and source != "Нейросеть":
-            response_text += f"\n\n📚 **Источник:** {source}"
+            response_text += f"\n\n📚 <b>Источник:</b> {source}"
         
         await thinking_msg.edit_text(response_text)
         
         # Если есть скрипт для оператора
         if script:
-            await message.answer(f"💬 **Что сказать клиенту:**\n{script}")
+            await message.answer(f"💬 <b>Что сказать клиенту:</b>\n{script}")
         
         # Спрашиваем о точности ответа
         accuracy_stats["total"] += 1
@@ -635,7 +568,7 @@ async def handle_accuracy_feedback(callback: types.CallbackQuery):
         # Уведомляем администратора
         question = callback.message.reply_to_message.text
         admin_message = (
-            f"⚠️ **Неверный ответ бота**\n\n"
+            f"⚠️ <b>Неверный ответ бота</b>\n\n"
             f"❓ Вопрос: {question}\n"
             f"👤 Пользователь: {callback.from_user.first_name}\n"
             f"🆔 User ID: {callback.from_user.id}\n"
@@ -666,21 +599,24 @@ def get_last_update_time():
     try:
         with open(KNOWLEDGE_FILE, 'r', encoding='utf-8') as f:
             for line in f:
-                if 'ОБНОВЛЕНО' in line:
-                    return line.split('ОБНОВЛЕНО ')[1].strip()
+                if 'Время сбора:' in line:
+                    return line.split('Время сбора: ')[1].strip()
     except:
         pass
     return "Неизвестно"
 
-# Создание необходимых директорий
-def setup_directories():
-    os.makedirs('database', exist_ok=True)
-    os.makedirs('logs', exist_ok=True)
-
 async def main():
     """Основная функция запуска бота"""
-    setup_directories()
+    # Создаем необходимые директории
+    os.makedirs('database', exist_ok=True)
+    os.makedirs('logs', exist_ok=True)
+    
+    # Инициализируем БД
+    DatabaseManager.init_db()
+    
     logger.info("Запуск бота МосОблЕИРЦ...")
+    logger.info(f"Telegram Bot Token: {TELEGRAM_BOT_TOKEN[:10]}...")
+    logger.info(f"HuggingFace API Key: {HUGGINGFACE_API_KEY[:10]}...")
     
     try:
         await dp.start_polling(bot)
